@@ -2,7 +2,7 @@
 // It is subject to the license terms in the LICENSE file found in the top-level directory
 // of this distribution and at http://opencv.org/license.html.
 //
-// Copyright (C) 2018 Intel Corporation
+// Copyright (C) 2018-2020 Intel Corporation
 
 
 #ifndef OPENCV_GAPI_GMAT_HPP
@@ -46,10 +46,10 @@ struct GOrigin;
  *    `cv::GArray<T>`    | std::vector<T>
  *    `cv::GOpaque<T>`   | T
  */
-class GAPI_EXPORTS GMat
+class GAPI_EXPORTS_W_SIMPLE GMat
 {
 public:
-    GMat();                                 // Empty constructor
+    GAPI_WRAP GMat();                       // Empty constructor
     GMat(const GNode &n, std::size_t out);  // Operation result constructor
 
     GOrigin& priv();                        // Internal use only
@@ -60,12 +60,6 @@ private:
 };
 
 class GAPI_EXPORTS GMatP : public GMat
-{
-public:
-    using GMat::GMat;
-};
-
-class GAPI_EXPORTS GFrame : public GMat
 {
 public:
     using GMat::GMat;

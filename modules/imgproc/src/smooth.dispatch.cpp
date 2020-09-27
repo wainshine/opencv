@@ -48,6 +48,7 @@
 #include <opencv2/core/utils/configuration.private.hpp>
 
 #include <vector>
+#include <iostream>
 
 #include "opencv2/core/hal/intrin.hpp"
 #include "opencl_kernels_imgproc.hpp"
@@ -257,23 +258,20 @@ softdouble getGaussianKernelFixedPoint_ED(CV_OUT std::vector<int64_t>& result, c
 }
 
 static void getGaussianKernel(int n, double sigma, int ktype, Mat& res) { res = getGaussianKernel(n, sigma, ktype); }
-template <typename T> static void getGaussianKernel(int n, double sigma, int, std::vector<T>& res);
-//{ res = getFixedpointGaussianKernel<T>(n, sigma); }
-
-template<> void getGaussianKernel<ufixedpoint16>(int n, double sigma, int, std::vector<ufixedpoint16>& res)
+template <typename FT> static void getGaussianKernel(int n, double sigma, int, std::vector<FT>& res)
 {
     std::vector<softdouble> res_sd;
     softdouble s0 = getGaussianKernelBitExact(res_sd, n, sigma);
     CV_UNUSED(s0);
 
     std::vector<int64_t> fixed_256;
-    softdouble approx_err = getGaussianKernelFixedPoint_ED(fixed_256, res_sd, 8);
+    softdouble approx_err = getGaussianKernelFixedPoint_ED(fixed_256, res_sd, FT::fixedShift);
     CV_UNUSED(approx_err);
 
     res.resize(n);
     for (int i = 0; i < n; i++)
     {
-        res[i] = ufixedpoint16::fromRaw((uint16_t)fixed_256[i]);
+        res[i] = FT::fromRaw((typename FT::raw_t)fixed_256[i]);
         //printf("%03d: %d\n", i, res[i].raw());
     }
 }
@@ -637,10 +635,9 @@ void GaussianBlur(InputArray _src, OutputArray _dst, Size ksize,
         return;
     }
 
-    bool useOpenCL = (ocl::isOpenCLActivated() && _dst.isUMat() && _src.dims() <= 2 &&
-               ((ksize.width == 3 && ksize.height == 3) ||
-               (ksize.width == 5 && ksize.height == 5)) &&
-               _src.rows() > ksize.height && _src.cols() > ksize.width);
+    bool useOpenCL = ocl::isOpenCLActivated() && _dst.isUMat() && _src.dims() <= 2 &&
+               _src.rows() >= ksize.height && _src.cols() >= ksize.width &&
+               ksize.width > 1 && ksize.height > 1;
     CV_UNUSED(useOpenCL);
 
     int sdepth = CV_MAT_DEPTH(type), cn = CV_MAT_CN(type);
@@ -648,27 +645,13 @@ void GaussianBlur(InputArray _src, OutputArray _dst, Size ksize,
     Mat kx, ky;
     createGaussianKernels(kx, ky, type, ksize, sigma1, sigma2);
 
-    CV_OCL_RUN(useOpenCL, ocl_GaussianBlur_8UC1(_src, _dst, ksize, CV_MAT_DEPTH(type), kx, ky, borderType));
+    CV_OCL_RUN(useOpenCL && sdepth == CV_8U &&
+            ((ksize.width == 3 && ksize.height == 3) ||
+            (ksize.width == 5 && ksize.height == 5)),
+            ocl_GaussianBlur_8UC1(_src, _dst, ksize, CV_MAT_DEPTH(type), kx, ky, borderType)
+    );
 
-    CV_OCL_RUN(_dst.isUMat() && _src.dims() <= 2 && (size_t)_src.rows() > kx.total() && (size_t)_src.cols() > kx.total(),
-               ocl_sepFilter2D(_src, _dst, sdepth, kx, ky, Point(-1, -1), 0, borderType))
-
-    Mat src = _src.getMat();
-    Mat dst = _dst.getMat();
-
-    Point ofs;
-    Size wsz(src.cols, src.rows);
-    if(!(borderType & BORDER_ISOLATED))
-        src.locateROI( wsz, ofs );
-
-    CALL_HAL(gaussianBlur, cv_hal_gaussianBlur, src.ptr(), src.step, dst.ptr(), dst.step, src.cols, src.rows, sdepth, cn,
-             ofs.x, ofs.y, wsz.width - src.cols - ofs.x, wsz.height - src.rows - ofs.y, ksize.width, ksize.height,
-             sigma1, sigma2, borderType&~BORDER_ISOLATED);
-
-    CV_OVX_RUN(true,
-               openvx_gaussianBlur(src, dst, ksize, sigma1, sigma2, borderType))
-
-    if(sdepth == CV_8U && ((borderType & BORDER_ISOLATED) || !_src.getMat().isSubmatrix()))
+    if(sdepth == CV_8U && ((borderType & BORDER_ISOLATED) || !_src.isSubmatrix()))
     {
         std::vector<ufixedpoint16> fkx, fky;
         createGaussianKernels(fkx, fky, type, ksize, sigma1, sigma2);
@@ -684,6 +667,17 @@ void GaussianBlur(InputArray _src, OutputArray _dst, Size ksize,
         }
         else
         {
+            CV_OCL_RUN(useOpenCL,
+                    ocl_sepFilter2D_BitExact(_src, _dst, sdepth,
+                            ksize,
+                            (const uint16_t*)&fkx[0], (const uint16_t*)&fky[0],
+                            Point(-1, -1), 0, borderType,
+                            8/*shift_bits*/)
+            );
+
+            Mat src = _src.getMat();
+            Mat dst = _dst.getMat();
+
             if (src.data == dst.data)
                 src = src.clone();
             CV_CPU_DISPATCH(GaussianBlurFixedPoint, (src, dst, (const uint16_t*)&fkx[0], (int)fkx.size(), (const uint16_t*)&fky[0], (int)fky.size(), borderType),
@@ -691,6 +685,66 @@ void GaussianBlur(InputArray _src, OutputArray _dst, Size ksize,
             return;
         }
     }
+    if(sdepth == CV_16U && ((borderType & BORDER_ISOLATED) || !_src.isSubmatrix()))
+    {
+        CV_LOG_INFO(NULL, "GaussianBlur: running bit-exact version...");
+
+        std::vector<ufixedpoint32> fkx, fky;
+        createGaussianKernels(fkx, fky, type, ksize, sigma1, sigma2);
+
+        static bool param_check_gaussian_blur_bitexact_kernels = utils::getConfigurationParameterBool("OPENCV_GAUSSIANBLUR_CHECK_BITEXACT_KERNELS", false);
+        if (param_check_gaussian_blur_bitexact_kernels && !validateGaussianBlurKernel(fkx))
+        {
+            CV_LOG_INFO(NULL, "GaussianBlur: bit-exact fx kernel can't be applied: ksize=" << ksize << " sigma=" << Size2d(sigma1, sigma2));
+        }
+        else if (param_check_gaussian_blur_bitexact_kernels && !validateGaussianBlurKernel(fky))
+        {
+            CV_LOG_INFO(NULL, "GaussianBlur: bit-exact fy kernel can't be applied: ksize=" << ksize << " sigma=" << Size2d(sigma1, sigma2));
+        }
+        else
+        {
+            // TODO: implement ocl_sepFilter2D_BitExact -- how to deal with bdepth?
+            // CV_OCL_RUN(useOpenCL,
+            //         ocl_sepFilter2D_BitExact(_src, _dst, sdepth,
+            //                 ksize,
+            //                 (const uint32_t*)&fkx[0], (const uint32_t*)&fky[0],
+            //                 Point(-1, -1), 0, borderType,
+            //                 16/*shift_bits*/)
+            // );
+
+            Mat src = _src.getMat();
+            Mat dst = _dst.getMat();
+
+            if (src.data == dst.data)
+                src = src.clone();
+            CV_CPU_DISPATCH(GaussianBlurFixedPoint, (src, dst, (const uint32_t*)&fkx[0], (int)fkx.size(), (const uint32_t*)&fky[0], (int)fky.size(), borderType),
+                CV_CPU_DISPATCH_MODES_ALL);
+            return;
+        }
+    }
+
+#ifdef HAVE_OPENCL
+    if (useOpenCL)
+    {
+        sepFilter2D(_src, _dst, sdepth, kx, ky, Point(-1, -1), 0, borderType);
+        return;
+    }
+#endif
+
+    Mat src = _src.getMat();
+    Mat dst = _dst.getMat();
+
+    Point ofs;
+    Size wsz(src.cols, src.rows);
+    if(!(borderType & BORDER_ISOLATED))
+        src.locateROI( wsz, ofs );
+
+    CALL_HAL(gaussianBlur, cv_hal_gaussianBlur, src.ptr(), src.step, dst.ptr(), dst.step, src.cols, src.rows, sdepth, cn,
+             ofs.x, ofs.y, wsz.width - src.cols - ofs.x, wsz.height - src.rows - ofs.y, ksize.width, ksize.height,
+             sigma1, sigma2, borderType&~BORDER_ISOLATED);
+
+    CV_OVX_RUN(true,
+               openvx_gaussianBlur(src, dst, ksize, sigma1, sigma2, borderType))
 
 #if defined ENABLE_IPP_GAUSSIAN_BLUR
     // IPP is not bit-exact to OpenCV implementation

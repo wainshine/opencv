@@ -34,6 +34,10 @@ module_imports = []
 # the list is loaded from misc/objc/gen_dict.json defined for the module and its dependencies
 class_ignore_list = []
 
+
+# list of enum names, which should be skipped by wrapper generator
+enum_ignore_list = []
+
 # list of constant names, which should be skipped by wrapper generator
 # ignored constants can be defined using regular expressions
 const_ignore_list = []
@@ -46,23 +50,23 @@ missing_consts = {}
 
 type_dict = {
     ""        : {"objc_type" : ""}, # c-tor ret_type
-    "void"    : {"objc_type" : "void", "is_primitive" : True},
-    "bool"    : {"objc_type" : "BOOL", "is_primitive" : True, "to_cpp": "(bool)%(n)s"},
-    "char"    : {"objc_type" : "char", "is_primitive" : True},
-    "int"     : {"objc_type" : "int", "is_primitive" : True, "out_type" : "int*", "out_type_ptr": "%(n)s", "out_type_ref": "*(int*)(%(n)s)"},
-    "long"    : {"objc_type" : "long", "is_primitive" : True},
-    "float"   : {"objc_type" : "float", "is_primitive" : True, "out_type" : "float*", "out_type_ptr": "%(n)s", "out_type_ref": "*(float*)(%(n)s)"},
-    "double"  : {"objc_type" : "double", "is_primitive" : True, "out_type" : "double*", "out_type_ptr": "%(n)s", "out_type_ref": "*(double*)(%(n)s)"},
+    "void"    : {"objc_type" : "void", "is_primitive" : True, "swift_type": "Void"},
+    "bool"    : {"objc_type" : "BOOL", "is_primitive" : True, "to_cpp": "(bool)%(n)s", "swift_type": "Bool"},
+    "char"    : {"objc_type" : "char", "is_primitive" : True, "swift_type": "Int8"},
+    "int"     : {"objc_type" : "int", "is_primitive" : True, "out_type" : "int*", "out_type_ptr": "%(n)s", "out_type_ref": "*(int*)(%(n)s)", "swift_type": "Int32"},
+    "long"    : {"objc_type" : "long", "is_primitive" : True, "swift_type": "Int"},
+    "float"   : {"objc_type" : "float", "is_primitive" : True, "out_type" : "float*", "out_type_ptr": "%(n)s", "out_type_ref": "*(float*)(%(n)s)", "swift_type": "Float"},
+    "double"  : {"objc_type" : "double", "is_primitive" : True, "out_type" : "double*", "out_type_ptr": "%(n)s", "out_type_ref": "*(double*)(%(n)s)", "swift_type": "Double"},
     "size_t"  : {"objc_type" : "size_t", "is_primitive" : True},
-    "int64"   : {"objc_type" : "long", "is_primitive" : True},
-    "string"  : {"objc_type" : "NSString*", "is_primitive" : True, "from_cpp": "[NSString stringWithUTF8String:%(n)s.c_str()]", "cast_to": "std::string"}
+    "int64"   : {"objc_type" : "long", "is_primitive" : True, "swift_type": "Int"},
+    "string"  : {"objc_type" : "NSString*", "is_primitive" : True, "from_cpp": "[NSString stringWithUTF8String:%(n)s.c_str()]", "cast_to": "std::string", "swift_type": "String"}
 }
 
 # Defines a rule to add extra prefixes for names from specific namespaces.
 # In example, cv::fisheye::stereoRectify from namespace fisheye is wrapped as fisheye_stereoRectify
 namespaces_dict = {}
 
-# { class : [ header ] }
+# { module: { class | "*" : [ header ]} }
 AdditionalImports = {}
 
 # { class : { func : {declaration, implementation} } }
@@ -74,6 +78,9 @@ func_arg_fix = {}
 # { class : { enum: fixed_enum } }
 enum_fix = {}
 
+# { class : { enum: { const: fixed_const} } }
+const_fix = {}
+
 # { (class, func) : objc_signature }
 method_dict = {
     ("Mat", "convertTo") : "-convertTo:rtype:alpha:beta:",
@@ -82,6 +89,8 @@ method_dict = {
     ("Mat", "ones") : "+ones:cols:type:",
     ("Mat", "dot") : "-dot:"
 }
+
+modules = []
 
 def read_contents(fname):
     with open(fname, 'r') as f:
@@ -124,7 +133,7 @@ class GeneralInfo():
 
             docstring += sanitize_documentation_string(doc, type)
         elif type == "class":
-            docstring += "/**\n* The " + self.name + " module\n*/\n"
+            docstring += "/**\n * The " + self.name + " module\n */\n"
 
         self.docstring = docstring
 
@@ -199,6 +208,19 @@ def cast_to(t):
         return type_dict[t]["cast_to"]
     return t
 
+def gen_class_doc(docstring, module, members, enums):
+    lines = docstring.splitlines()
+    lines.insert(len(lines)-1, " *")
+    if len(members) > 0:
+        lines.insert(len(lines)-1, " * Member classes: " + ", ".join([("`" + m + "`") for m in members]))
+        lines.insert(len(lines)-1, " *")
+    else:
+        lines.insert(len(lines)-1, " * Member of `" + module + "`")
+    if len(enums) > 0:
+        lines.insert(len(lines)-1, " * Member enums: " + ", ".join([("`" + m + "`") for m in enums]))
+
+    return "\n".join(lines)
+
 class ClassPropInfo():
     def __init__(self, decl): # [f_ctype, f_name, '', '/RW']
         self.ctype = decl[0]
@@ -211,14 +233,15 @@ class ClassPropInfo():
 class ClassInfo(GeneralInfo):
     def __init__(self, decl, namespaces=[]): # [ 'class/struct cname', ': base', [modlist] ]
         GeneralInfo.__init__(self, "class", decl, namespaces)
-        self.cname = get_cname(self.name)
+        self.cname = self.name if not self.classname else self.classname + "_" + self.name
+        self.real_cname = self.name if not self.classname else self.classname + "::" + self.name
         self.methods = []
         self.methods_suffixes = {}
         self.consts = [] # using a list to save the occurrence order
         self.private_consts = []
         self.imports = set()
         self.props= []
-        self.objc_name = self.name
+        self.objc_name = self.name if not self.classname else self.classname + self.name
         self.smart = None # True if class stores Ptr<T>* instead of T* in nativeObj field
         self.additionalImports = None # additional import files
         self.enum_declarations = None # Objective-C enum declarations stream
@@ -231,8 +254,14 @@ class ClassInfo(GeneralInfo):
                 self.objc_name = m[1:]
         self.base = ''
         self.is_base_class = True
+        self.native_ptr_name = "nativePtr"
+        self.member_classes = [] # Only relevant for modules
+        self.member_enums = [] # Only relevant for modules
         if decl[1]:
             self.base = re.sub(r"^.*:", "", decl[1].split(",")[0]).strip().replace(self.objc_name, "")
+            if self.base:
+                self.is_base_class = False
+                self.native_ptr_name = "nativePtr" + self.objc_name
 
     def __repr__(self):
         return Template("CLASS $namespace::$classpath.$name : $base").substitute(**self.__dict__)
@@ -296,7 +325,6 @@ class ClassInfo(GeneralInfo):
         if self.base:
             self.objc_header_template = T_OBJC_CLASS_HEADER
             self.objc_body_template = T_OBJC_CLASS_BODY
-            self.is_base_class = False
         else:
             self.base = "NSObject"
             if self.name != Module:
@@ -326,26 +354,25 @@ class ClassInfo(GeneralInfo):
                             nativePointerHandling = Template(
 """
 #ifdef __cplusplus
-@property(readonly)$cName* nativePtr;
+@property(readonly)cv::Ptr<$cName> $native_ptr_name;
 #endif
 
-- (void)dealloc;
-
 #ifdef __cplusplus
-- (instancetype)initWithNativePtr:($cName*)nativePtr;
-+ (instancetype)fromNative:($cName*)nativePtr;
+- (instancetype)initWithNativePtr:(cv::Ptr<$cName>)nativePtr;
++ (instancetype)fromNative:(cv::Ptr<$cName>)nativePtr;
 #endif
 """
                             ).substitute(
-                                cName = self.fullName(isCPP=True)
-                            ) if self.is_base_class else "",
+                                cName = self.fullName(isCPP=True),
+                                native_ptr_name = self.native_ptr_name
+                            ),
                             manualMethodDeclations = "",
                             methodDeclarations = self.method_declarations.getvalue(),
                             name = self.name,
                             objcName = self.objc_name,
                             cName = self.cname,
                             imports = "\n".join(self.getImports(M)),
-                            docs = self.docstring,
+                            docs = gen_class_doc(self.docstring, M, self.member_classes, self.member_enums),
                             base = self.base)
 
     def generateObjcBodyCode(self, m, M):
@@ -353,35 +380,31 @@ class ClassInfo(GeneralInfo):
                             module = M,
                             nativePointerHandling=Template(
 """
-- (void)dealloc {
-    if (_nativePtr != NULL) {
-        delete _nativePtr;
-    }
-}
-
-- (instancetype)initWithNativePtr:($cName*)nativePtr {
-    self = [super init];
+- (instancetype)initWithNativePtr:(cv::Ptr<$cName>)nativePtr {
+    self = [super $init_call];
     if (self) {
-        _nativePtr = nativePtr;
+        _$native_ptr_name = nativePtr;
     }
     return self;
 }
 
-+ (instancetype)fromNative:($cName*)nativePtr {
++ (instancetype)fromNative:(cv::Ptr<$cName>)nativePtr {
     return [[$objcName alloc] initWithNativePtr:nativePtr];
 }
 """
                             ).substitute(
-                                cName=self.fullName(isCPP=True),
-                                objcName=self.objc_name
-                            ) if self.is_base_class else "",
+                                cName = self.fullName(isCPP=True),
+                                objcName = self.objc_name,
+                                native_ptr_name = self.native_ptr_name,
+                                init_call = "init" if self.is_base_class else "initWithNativePtr:nativePtr"
+                            ),
                             manualMethodDeclations = "",
                             methodImplementations = self.method_implementations.getvalue(),
                             name = self.name,
                             objcName = self.objc_name,
                             cName = self.cname,
                             imports = "\n".join(self.getImports(M)),
-                            docs = self.docstring,
+                            docs = gen_class_doc(self.docstring, M, self.member_classes, self.member_enums),
                             base = self.base)
 
 class ArgInfo():
@@ -407,10 +430,12 @@ class ArgInfo():
                                                                   defval=self.defval)
 
 class FuncInfo(GeneralInfo):
-    def __init__(self, decl, namespaces=[]): # [ funcname, return_ctype, [modifiers], [args] ]
+    def __init__(self, decl, module, namespaces=[]): # [ funcname, return_ctype, [modifiers], [args] ]
         GeneralInfo.__init__(self, "func", decl, namespaces)
         self.cname = get_cname(decl[0])
-        self.objc_name = self.name
+        nested_type = self.classpath.find(".") != -1
+        self.objc_name = self.name if not nested_type else self.classpath.replace(".", "")
+        self.classname = self.classname if not nested_type else self.classpath.replace(".", "_")
         self.swift_name = self.name
         self.cv_name = self.fullName(isCPP=True)
         self.isconstructor = self.name == self.classname
@@ -424,7 +449,7 @@ class FuncInfo(GeneralInfo):
         self.static = ["","static"][ "/S" in decl[2] ]
         self.ctype = re.sub(r"^CvTermCriteria", "TermCriteria", decl[1] or "")
         self.args = []
-        func_fix_map = func_arg_fix.get(self.objc_name, {})
+        func_fix_map = func_arg_fix.get(self.classname or module, {}).get(self.objc_name, {})
         for a in decl[3]:
             arg = a[:]
             arg_fix_map = func_fix_map.get(arg[1], {})
@@ -434,9 +459,10 @@ class FuncInfo(GeneralInfo):
             self.args.append(ArgInfo(arg))
 
         if type_complete(self.args, self.ctype):
-            func_fix_map = func_arg_fix.get(self.signature(self.args), {})
+            func_fix_map = func_arg_fix.get(self.classname or module, {}).get(self.signature(self.args), {})
             name_fix_map = func_fix_map.get(self.name, {})
             self.objc_name = name_fix_map.get('name', self.objc_name)
+            self.swift_name = name_fix_map.get('swift_name', self.swift_name)
             for arg in self.args:
                 arg_fix_map = func_fix_map.get(arg.name, {})
                 arg.ctype = arg_fix_map.get('ctype', arg.ctype) #fixing arg type
@@ -508,6 +534,62 @@ def build_objc_method_name(args):
         objc_method_name += a.name + ":"
     return objc_method_name
 
+def get_swift_type(ctype):
+    has_swift_type = "swift_type" in type_dict[ctype]
+    swift_type = type_dict[ctype]["swift_type"] if has_swift_type else type_dict[ctype]["objc_type"]
+    if swift_type[-1:] == "*":
+        swift_type = swift_type[:-1]
+    if not has_swift_type:
+        if "v_type" in type_dict[ctype]:
+            swift_type = "[" + swift_type + "]"
+        elif "v_v_type" in type_dict[ctype]:
+            swift_type = "[[" + swift_type + "]]"
+    return swift_type
+
+def build_swift_extension_decl(name, args, constructor, static, ret_type):
+    extension_decl = ("class " if static else "") + (("func " + name) if not constructor else "convenience init") + "("
+    swift_args = []
+    for a in args:
+        if a.ctype not in type_dict:
+            if not a.defval and a.ctype.endswith("*"):
+                a.defval = 0
+            if a.defval:
+                a.ctype = ''
+                continue
+        if not a.ctype:  # hidden
+            continue
+        swift_type = get_swift_type(a.ctype)
+
+        if "O" in a.out:
+            if type_dict[a.ctype].get("primitive_type", False):
+                swift_type = "UnsafeMutablePointer<" + swift_type + ">"
+            elif "v_type" in type_dict[a.ctype] or "v_v_type" in type_dict[a.ctype] or type_dict[a.ctype].get("primitive_vector", False) or type_dict[a.ctype].get("primitive_vector_vector", False):
+                swift_type = "inout " + swift_type
+
+        swift_args.append(a.name + ': ' + swift_type)
+
+    extension_decl += ", ".join(swift_args) + ")"
+    if ret_type:
+        extension_decl += " -> " + get_swift_type(ret_type)
+    return extension_decl
+
+def extension_arg(a):
+    return a.ctype in type_dict and (type_dict[a.ctype].get("primitive_vector", False) or type_dict[a.ctype].get("primitive_vector_vector", False) or (("v_type" in type_dict[a.ctype] or "v_v_type" in type_dict[a.ctype]) and "O" in a.out))
+
+def extension_tmp_arg(a):
+    if a.ctype in type_dict:
+        if type_dict[a.ctype].get("primitive_vector", False) or type_dict[a.ctype].get("primitive_vector_vector", False):
+            return a.name + "Vector"
+        elif ("v_type" in type_dict[a.ctype] or "v_v_type" in type_dict[a.ctype]) and "O" in a.out:
+            return a.name + "Array"
+    return a.name
+
+def make_swift_extension(args):
+    for a in args:
+        if extension_arg(a):
+            return True
+    return False
+
 def build_swift_signature(args):
     swift_signature = ""
     for a in args:
@@ -521,6 +603,55 @@ def build_swift_signature(args):
             continue
         swift_signature += a.name + ":"
     return swift_signature
+
+def build_unrefined_call(name, args, constructor, static, classname, has_ret):
+    swift_refine_call = ("let ret = " if has_ret and not constructor else "") + ((classname + ".") if static else "") + (name if not constructor else "self.init")
+    call_args = []
+    for a in args:
+        if a.ctype not in type_dict:
+            if not a.defval and a.ctype.endswith("*"):
+                a.defval = 0
+            if a.defval:
+                a.ctype = ''
+                continue
+        if not a.ctype:  # hidden
+            continue
+        call_args.append(a.name + ": " + extension_tmp_arg(a))
+    swift_refine_call += "(" + ", ".join(call_args) + ")"
+    return swift_refine_call
+
+def build_swift_logues(args):
+    prologue = []
+    epilogue = []
+    for a in args:
+        if a.ctype not in type_dict:
+            if not a.defval and a.ctype.endswith("*"):
+                a.defval = 0
+            if a.defval:
+                a.ctype = ''
+                continue
+        if not a.ctype:  # hidden
+            continue
+        if a.ctype in type_dict:
+            if type_dict[a.ctype].get("primitive_vector", False):
+                prologue.append("let " + extension_tmp_arg(a) + " = " + type_dict[a.ctype]["objc_type"][:-1] + "(" + a.name + ")")
+                if "O" in a.out:
+                    unsigned = type_dict[a.ctype].get("unsigned", False)
+                    array_prop = "array" if not unsigned else "unsignedArray"
+                    epilogue.append(a.name + ".removeAll()")
+                    epilogue.append(a.name + ".append(contentsOf: " +  extension_tmp_arg(a) + "." + array_prop + ")")
+            elif type_dict[a.ctype].get("primitive_vector_vector", False):
+                if not "O" in a.out:
+                    prologue.append("let " + extension_tmp_arg(a) + " = " + a.name + ".map {" + type_dict[a.ctype]["objc_type"][:-1] + "($0) }")
+                else:
+                    prologue.append("let " + extension_tmp_arg(a) + " = NSMutableArray(array: " + a.name + ".map {" + type_dict[a.ctype]["objc_type"][:-1] + "($0) })")
+                    epilogue.append(a.name + ".removeAll()")
+                    epilogue.append(a.name + ".append(contentsOf: " + extension_tmp_arg(a) + ".map { ($.0 as! " + type_dict[a.ctype]["objc_type"][:-1] + ").array  })")
+            elif ("v_type" in type_dict[a.ctype] or "v_v_type" in type_dict[a.ctype]) and "O" in a.out:
+                prologue.append("let " +  extension_tmp_arg(a) + " = NSMutableArray(array: " + a.name + ")")
+                epilogue.append(a.name + ".removeAll()")
+                epilogue.append(a.name + ".append(contentsOf: " +  extension_tmp_arg(a) + " as! " + get_swift_type(a.ctype) + ")")
+    return prologue, epilogue
 
 def add_method_to_dict(class_name, fi):
     static = fi.static if fi.classname else True
@@ -555,6 +686,7 @@ class ObjectiveCWrapperGenerator(object):
         self.classes["Mat"].namespace = "cv"
         self.module = ""
         self.Module = ""
+        self.extension_implementations = None # Swift extensions implementations stream
         self.ported_func_list = []
         self.skipped_func_list = []
         self.def_args_hist = {} # { def_args_cnt : funcs_cnt }
@@ -564,7 +696,9 @@ class ObjectiveCWrapperGenerator(object):
         if classinfo.name in class_ignore_list:
             logging.info('ignored: %s', classinfo)
             return
-        name = classinfo.name
+        if classinfo.name != self.Module:
+            self.classes[self.Module].member_classes.append(classinfo.objc_name)
+        name = classinfo.cname
         if self.isWrapped(name) and not classinfo.base:
             logging.warning('duplicated: %s', classinfo)
             return
@@ -576,7 +710,7 @@ class ObjectiveCWrapperGenerator(object):
             type_dict.setdefault(name, {}).update(
                 { "objc_type" : classinfo.objc_name + "*",
                   "from_cpp" : "[" + classinfo.objc_name + " fromNative:%(n)s]",
-                  "to_cpp" : "*(" + classinfo.namespace.replace(".", "::") + "::" + classinfo.objc_name +  "*)(%(n)s.nativePtr)" }
+                  "to_cpp" : "*(%(n)s." + classinfo.native_ptr_name + ")" }
             )
 
         # missing_consts { Module : { public : [[name, val],...], private : [[]...] } }
@@ -596,9 +730,11 @@ class ObjectiveCWrapperGenerator(object):
             type_dict.setdefault("Ptr_"+name, {}).update(
                 { "objc_type" : classinfo.objc_name + "*",
                   "c_type" : name,
-                  "to_cpp": "%(n)s.nativePtr",
-                  "from_cpp_ptr": "[" + name + " fromNativePtr:%(n)s]"}
+                  "real_c_type" : classinfo.real_cname,
+                  "to_cpp": "%(n)s." + classinfo.native_ptr_name,
+                  "from_cpp": "[" + name + " fromNative:%(n)s]"}
             )
+
         logging.info('ok: class %s, name: %s, base: %s', classinfo, name, classinfo.base)
 
     def add_const(self, decl, scope=None, enumType=None): # [ "const cname", val, [], [] ]
@@ -606,6 +742,12 @@ class ObjectiveCWrapperGenerator(object):
         if constinfo.isIgnored():
             logging.info('ignored: %s', constinfo)
         else:
+            objc_type = enumType.rsplit(".", 1)[-1] if enumType else ""
+            if const_fix.has_key(constinfo.classname) and const_fix[constinfo.classname].has_key(objc_type) and const_fix[constinfo.classname][objc_type].has_key(constinfo.name):
+                fixed_const = const_fix[constinfo.classname][objc_type][constinfo.name]
+                constinfo.name = fixed_const
+                constinfo.cname = fixed_const
+
             if not self.isWrapped(constinfo.classname):
                 logging.info('class not found: %s', constinfo)
                 constinfo.name = constinfo.classname + '_' + constinfo.name
@@ -622,7 +764,7 @@ class ObjectiveCWrapperGenerator(object):
                 ci.addConst(constinfo)
                 logging.info('ok: %s', constinfo)
 
-    def add_enum(self, decl, scope): # [ "enum cname", "", [], [] ]
+    def add_enum(self, decl): # [ "enum cname", "", [], [] ]
         enumType = decl[0].rsplit(" ", 1)[1]
         if enumType.endswith("<unnamed>"):
             enumType = None
@@ -630,6 +772,8 @@ class ObjectiveCWrapperGenerator(object):
             ctype = normalize_class_name(enumType)
             constinfo = ConstInfo(decl[3][0], namespaces=self.namespaces, enumType=enumType)
             objc_type = enumType.rsplit(".", 1)[-1]
+            if objc_type in enum_ignore_list:
+                return
             if enum_fix.has_key(constinfo.classname):
                 objc_type = enum_fix[constinfo.classname].get(objc_type, objc_type)
             import_module = constinfo.classname if constinfo.classname and constinfo.classname != objc_type else self.Module
@@ -643,13 +787,15 @@ class ObjectiveCWrapperGenerator(object):
                                      "objc_type": objc_type,
                                      "is_enum": True,
                                      "import_module": import_module}
+            self.classes[self.Module].member_enums.append(objc_type)
+
         const_decls = decl[3]
 
         for decl in const_decls:
-            self.add_const(decl, scope, enumType)
+            self.add_const(decl, self.Module, enumType)
 
     def add_func(self, decl):
-        fi = FuncInfo(decl, namespaces=self.namespaces)
+        fi = FuncInfo(decl, self.Module, namespaces=self.namespaces)
         classname = fi.classname or self.Module
         if classname in class_ignore_list:
             logging.info('ignored: %s', fi)
@@ -669,6 +815,8 @@ class ObjectiveCWrapperGenerator(object):
 
     def save(self, path, buf):
         global total_files, updated_files
+        if len(buf) == 0:
+            return
         total_files += 1
         if os.path.exists(path):
             with open(path, "rt") as f:
@@ -683,14 +831,17 @@ class ObjectiveCWrapperGenerator(object):
         namespace = self.classes[cname].namespace if self.classes.has_key(cname) else "cv"
         return namespace.replace(".", "::") + "::"
 
-    def gen(self, srcfiles, module, output_path, output_objc_path, common_headers):
+    def gen(self, srcfiles, module, output_path, output_objc_path, common_headers, manual_classes):
         self.clear()
         self.module = module
         self.Module = module.capitalize()
+        extension_implementations = StringIO() # Swift extensions implementations stream
+        extension_signatures = []
+
         # TODO: support UMat versions of declarations (implement UMat-wrapper for Java)
         parser = hdr_parser.CppHeaderParser(generate_umat_decls=False)
 
-        self.add_class( ['class ' + self.Module, '', [], []] ) # [ 'class/struct cname', ':bases', [modlist] [props] ]
+        self.add_class( ['class ' + self.Module, '', [], []]) # [ 'class/struct cname', ':bases', [modlist] [props] ]
 
         # scan the headers and build more descriptive maps of classes, consts, functions
         includes = []
@@ -715,18 +866,21 @@ class ObjectiveCWrapperGenerator(object):
                     self.add_const(decl)
                 elif name.startswith("enum"):
                     # enum
-                    self.add_enum(decl, self.Module)
+                    self.add_enum(decl)
                 else: # function
                     self.add_func(decl)
+        self.classes[self.Module].member_classes += manual_classes
 
         logging.info("\n\n===== Generating... =====")
         package_path = os.path.join(output_objc_path, module)
         mkdir_p(package_path)
+        extension_file = "%s/%s/%sExt.swift" % (output_objc_path, module, self.Module)
+
         for ci in self.classes.values():
             if ci.name == "Mat":
                 continue
             ci.initCodeStreams(self.Module)
-            self.gen_class(ci)
+            self.gen_class(ci, self.module, extension_implementations, extension_signatures)
             classObjcHeaderCode = ci.generateObjcHeaderCode(self.module, self.Module, ci.objc_name)
             header_file = "%s/%s/%s.h" % (output_objc_path, module, ci.objc_name)
             self.save(header_file, classObjcHeaderCode)
@@ -734,6 +888,8 @@ class ObjectiveCWrapperGenerator(object):
             classObjcBodyCode = ci.generateObjcBodyCode(self.module, self.Module)
             self.save("%s/%s/%s.mm" % (output_objc_path, module, ci.objc_name), classObjcBodyCode)
             ci.cleanupCodeStreams()
+        self.save(extension_file, extension_implementations.getvalue())
+        extension_implementations.close()
         self.save(os.path.join(output_path, module+".txt"), self.makeReport())
 
     def makeReport(self):
@@ -778,7 +934,7 @@ class ObjectiveCWrapperGenerator(object):
             epilogue.append("CV2OBJC_CUSTOM(" + vector_full_type + ", " + objc_type[:-1] + ", " + vector_name + ", " + array_name + ", " + unconv_macro + ");")
             epilogue.append("#undef " + unconv_macro)
 
-    def gen_func(self, ci, fi):
+    def gen_func(self, ci, fi, extension_implementations, extension_signatures):
         logging.info("%s", fi)
         method_declarations = ci.method_declarations
         method_implementations = ci.method_implementations
@@ -870,6 +1026,7 @@ class ObjectiveCWrapperGenerator(object):
             # calculate method signature to check for uniqueness
             objc_args = build_objc_args(args)
             objc_signature = fi.signature(args)
+            swift_ext = make_swift_extension(args)
             logging.info("Objective-C: " + objc_signature)
 
             if objc_signature in objc_signatures:
@@ -933,20 +1090,21 @@ class ObjectiveCWrapperGenerator(object):
                 epilogue.append("CV2OBJC2(" + cpp_type + ", " + objc_type[:-1] + ", retValVector, retVal);")
             elif ret_type.startswith("Ptr_"):
                 cpp_type = type_dict[ret_type]["c_type"]
+                real_cpp_type = type_dict[ret_type].get("real_c_type", cpp_type)
                 namespace_prefix = self.get_namespace_prefix(cpp_type)
-                ret_val = namespace_prefix + cpp_type + "* retVal = "
+                ret_val = "cv::Ptr<" + namespace_prefix + real_cpp_type + "> retVal = "
                 ret = "return [" + type_dict[ret_type]["objc_type"][:-1] + " fromNative:retVal];"
             elif ret_type == "void":
                 ret_val = ""
                 ret = ""
             elif ret_type == "": # c-tor
                 constructor = True
-                ret_val = "return [self initWithNativePtr:new "
-                tail = "]"
+                ret_val = "return [self initWithNativePtr:cv::Ptr<" + fi.fullClass(isCPP=True) + ">(new "
+                tail = ")]"
                 ret = ""
             elif self.isWrapped(ret_type): # wrapped class
                 namespace_prefix = self.get_namespace_prefix(ret_type)
-                ret_val = namespace_prefix + ret_type + "* retVal = new " + namespace_prefix + ret_type + "("
+                ret_val = "cv::Ptr<" + namespace_prefix + ret_type + "> retVal = new " + namespace_prefix + ret_type + "("
                 tail = ")"
                 ret_type_dict = type_dict[ret_type]
                 from_cpp = ret_type_dict["from_cpp_ptr"] if ret_type_dict.has_key("from_cpp_ptr") else ret_type_dict["from_cpp"]
@@ -993,12 +1151,38 @@ class ObjectiveCWrapperGenerator(object):
                     prologue = "\n    " + "\n    ".join(prologue) if prologue else "",
                     epilogue = "\n    " + "\n    ".join(epilogue) if epilogue else "",
                     static = "+" if static else "-",
-                    obj_deref =  ("MAKE_PTR(" + fi.fullClass(isCPP=True) + ")->" if not ci.is_base_class else "_nativePtr->") if not static and not constructor else "",
+                    obj_deref = ("self." + ci.native_ptr_name + "->") if not static and not constructor else "",
                     cv_name = fi.cv_name if static else fi.fullClass(isCPP=True) if constructor else fi.name,
                     cv_args = ", ".join(cv_args),
                     tail = tail
                 )
             )
+
+            if swift_ext:
+                prototype = build_swift_extension_decl(fi.swift_name, args, constructor, static, ret_type)
+                if not (ci.name, prototype) in extension_signatures and not (ci.base, prototype) in extension_signatures:
+                    (pro, epi) = build_swift_logues(args)
+                    extension_implementations.write( Template(
+"""public extension $classname {
+    $deprecation_decl$prototype {
+$prologue
+$unrefined_call$epilogue$ret
+    }
+}
+
+"""
+                        ).substitute(
+                            classname = ci.name,
+                            deprecation_decl = "@available(*, deprecated)\n    " if fi.deprecated else "",
+                            prototype = prototype,
+                            prologue = "        " + "\n        ".join(pro),
+                            unrefined_call = "        " + build_unrefined_call(fi.swift_name, args, constructor, static, ci.name, ret_type is not None and ret_type != "void"),
+                            epilogue = "\n        " + "\n        ".join(epi) if len(epi) > 0 else "",
+                            ret = "\n        return ret" if ret_type is not None and ret_type != "void" and not constructor else ""
+                        )
+                    )
+                extension_signatures.append((ci.name, prototype))
+
             # adding method signature to dictionary
             objc_signatures.append(objc_signature)
 
@@ -1008,10 +1192,15 @@ class ObjectiveCWrapperGenerator(object):
             else:
                 break
 
-    def gen_class(self, ci):
+    def gen_class(self, ci, module, extension_implementations, extension_signatures):
         logging.info("%s", ci)
-        if ci.name in AdditionalImports:
-            ci.additionalImports.write("\n".join(["#import %s" % h for h in AdditionalImports[ci.name]]))
+        if module in AdditionalImports and (ci.name in AdditionalImports[module] or "*" in AdditionalImports[module]):
+            additional_imports = []
+            if "*" in AdditionalImports[module]:
+                additional_imports += AdditionalImports[module]["*"]
+            if ci.name in AdditionalImports[module]:
+                additional_imports += AdditionalImports[module][ci.name]
+            ci.additionalImports.write("\n".join(["#import %s" % h for h in additional_imports]))
 
         # constants
         wrote_consts_pragma = False
@@ -1060,7 +1249,7 @@ typedef NS_ENUM(int, {2}) {{
 
         # methods
         for fi in ci.getAllMethods():
-            self.gen_func(ci, fi)
+            self.gen_func(ci, fi, extension_implementations, extension_signatures)
         # props
         for pi in ci.props:
             ci.method_declarations.write("\n    //\n    // C++: %s %s::%s\n    //\n\n" % (pi.ctype, ci.fullName(isCPP=True), pi.name))
@@ -1068,29 +1257,47 @@ typedef NS_ENUM(int, {2}) {{
             objc_type = type_data.get("objc_type", pi.ctype)
             ci.addImports(pi.ctype, False)
             ci.method_declarations.write("@property " + ("(readonly) " if not pi.rw else "") + objc_type + " " + pi.name + ";\n")
-            ptr_ref = "MAKE_PTR(" + ci.fullName(isCPP=True) + ")->" if not ci.is_base_class else "_nativePtr->"
+            ptr_ref = "self." + ci.native_ptr_name + "->" if not ci.is_base_class else "self.nativePtr->"
             if type_data.has_key("v_type"):
-                vector_type = type_data["v_type"]
-                full_cpp_type = (self.get_namespace_prefix(vector_type) if (vector_type.find("::") == -1) else "") + vector_type
-                ret_val = "std::vector<" + full_cpp_type + "> retValVector = "
-                ci.method_implementations.write("-(NSArray<" + objc_type + ">*)" + pi.name + "{\n")
+                vector_cpp_type = type_data["v_type"]
+                has_namespace = vector_cpp_type.find("::") != -1
+                vector_full_cpp_type = self.fullTypeName(vector_cpp_type) if not has_namespace else vector_cpp_type
+                ret_val = "std::vector<" + vector_full_cpp_type + "> retValVector = "
+                ci.method_implementations.write("-(NSArray<" + objc_type + ">*)" + pi.name + " {\n")
                 ci.method_implementations.write("\tNSMutableArray<" + objc_type + ">* retVal = [NSMutableArray new];\n")
                 ci.method_implementations.write("\t" + ret_val + ptr_ref + pi.name + ";\n")
                 epilogue = []
-                self.build_cv2objc_epilogue(epilogue, vector_type, full_cpp_type, objc_type, "retValVector", "retVal")
+                self.build_cv2objc_epilogue(epilogue, vector_cpp_type, vector_full_cpp_type, objc_type, "retValVector", "retVal")
                 ci.method_implementations.write("\t" + ("\n\t".join(epilogue)) + "\n")
                 ci.method_implementations.write("\treturn retVal;\n}\n\n")
+            elif type_data.has_key("v_v_type"):
+                vector_cpp_type = type_data["v_v_type"]
+                has_namespace = vector_cpp_type.find("::") != -1
+                vector_full_cpp_type = self.fullTypeName(vector_cpp_type) if not has_namespace else vector_cpp_type
+                ret_val = "std::vector<std::vector<" + vector_full_cpp_type + ">> retValVectorVector = "
+                ci.method_implementations.write("-(NSArray<NSArray<" + objc_type + ">*>*)" + pi.name + " {\n")
+                ci.method_implementations.write("\tNSMutableArray<NSMutableArray<" + objc_type + ">*>* retVal = [NSMutableArray new];\n")
+                ci.method_implementations.write("\t" + ret_val + ptr_ref + pi.name + ";\n")
+                ci.method_implementations.write("\tCV2OBJC2(" + vector_full_cpp_type + ", " + objc_type[:-1] + ", retValVectorVector, retVal);\n")
+                ci.method_implementations.write("\treturn retVal;\n}\n\n")
+            elif self.isWrapped(pi.ctype):  # wrapped class
+                namespace_prefix = self.get_namespace_prefix(pi.ctype)
+                ci.method_implementations.write("-(" + objc_type + ")" + pi.name + " {\n")
+                ci.method_implementations.write("\tcv::Ptr<" + namespace_prefix + pi.ctype + "> retVal = new " + namespace_prefix + pi.ctype + "(" + ptr_ref + pi.name + ");\n")
+                from_cpp = type_data["from_cpp_ptr"] if type_data.has_key("from_cpp_ptr") else type_data["from_cpp"]
+                ci.method_implementations.write("\treturn " + (from_cpp % {"n": "retVal"}) + ";\n}\n\n")
             else:
                 from_cpp = type_data.get("from_cpp", "%(n)s")
                 retVal = from_cpp % {"n": (ptr_ref + pi.name)}
-                ci.method_implementations.write("-(" + objc_type + ")" + pi.name + "{\n\treturn " + retVal + ";\n}\n\n")
+                ci.method_implementations.write("-(" + objc_type + ")" + pi.name + " {\n\treturn " + retVal + ";\n}\n\n")
             if pi.rw:
                 if type_data.has_key("v_type"):
-                    vector_type = type_data["v_type"]
-                    full_cpp_type = (self.get_namespace_prefix(vector_type) if (vector_type.find("::") == -1) else "") + vector_type
+                    vector_cpp_type = type_data["v_type"]
+                    has_namespace = vector_cpp_type.find("::") != -1
+                    vector_full_cpp_type = self.fullTypeName(vector_cpp_type) if not has_namespace else vector_cpp_type
                     ci.method_implementations.write("-(void)set" + pi.name[0].upper() + pi.name[1:] + ":(NSArray<" + objc_type + ">*)" + pi.name + "{\n")
                     prologue = []
-                    self.build_objc2cv_prologue(prologue, vector_type, full_cpp_type, objc_type, "valVector", pi.name)
+                    self.build_objc2cv_prologue(prologue, vector_cpp_type, vector_full_cpp_type, objc_type, "valVector", pi.name)
                     ci.method_implementations.write("\t" + ("\n\t".join(prologue)) + "\n")
                     ci.method_implementations.write("\t" + ptr_ref + pi.name + " = valVector;\n}\n\n")
                 else:
@@ -1141,14 +1348,18 @@ typedef NS_ENUM(int, {2}) {{
 
     def finalize(self, output_objc_path):
         opencv_header_file = os.path.join(output_objc_path, framework_name + ".h")
-        self.save(opencv_header_file, '\n'.join(['#import "%s"' % os.path.basename(f) for f in self.header_files if os.path.basename(f) != "CVObjcUtil.h"]))
+        self.save(opencv_header_file, '\n'.join(['#import "%s"' % os.path.basename(f) for f in self.header_files]))
         cmakelist_template = read_contents(os.path.join(SCRIPT_DIR, 'templates/cmakelists.template'))
         cmakelist = Template(cmakelist_template).substitute(modules = ";".join(modules), framework = framework_name)
         self.save(os.path.join(dstdir, "CMakeLists.txt"), cmakelist)
         mkdir_p("./framework_build")
         mkdir_p("./test_build")
         mkdir_p("./doc_build")
-        copyfile(os.path.join(SCRIPT_DIR, '../doc/README.md'), "./doc_build/README.md")
+        with open(os.path.join(SCRIPT_DIR, '../doc/README.md')) as readme_in:
+            readme_body = readme_in.read()
+        readme_body += "\n\n\n##Modules\n\n" + ", ".join(["`" + m.capitalize() + "`" for m in modules])
+        with open("./doc_build/README.md", "w") as readme_out:
+            readme_out.write(readme_body)
         if framework_name != "OpenCV":
             for dirname, dirs, files in os.walk(os.path.join(testdir, "test")):
                 for filename in files:
@@ -1182,6 +1393,7 @@ def copy_objc_files(objc_files_dir, objc_base_path, module_path, include = False
         if (not os.path.exists(dest)) or (os.stat(src).st_mtime - os.stat(dest).st_mtime > 1):
             copyfile(src, dest)
             updated_files += 1
+    return objc_files
 
 def unescape(str):
     return str.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
@@ -1237,6 +1449,7 @@ def sanitize_documentation_string(doc, type):
         .replace("@param[in]", "@param") \
         .replace("@param[out]", "@param") \
         .replace("@ref", "REF:") \
+        .replace("@note", "NOTE:") \
         .replace("@returns", "@return") \
         .replace("@sa ", "@see ") \
         .replace("@snippet", "SNIPPET:") \
@@ -1307,7 +1520,6 @@ if __name__ == "__main__":
     generator = ObjectiveCWrapperGenerator()
 
     gen_dict_files = []
-    modules = []
     framework_name = args.framework
 
     print("Objective-C: Processing OpenCV modules: %d" % len(config['modules']))
@@ -1349,24 +1561,28 @@ if __name__ == "__main__":
             with open(gendict_fname) as f:
                 gen_type_dict = json.load(f)
             class_ignore_list += gen_type_dict.get("class_ignore_list", [])
+            enum_ignore_list += gen_type_dict.get("enum_ignore_list", [])
             const_ignore_list += gen_type_dict.get("const_ignore_list", [])
             const_private_list += gen_type_dict.get("const_private_list", [])
             missing_consts.update(gen_type_dict.get("missing_consts", {}))
             type_dict.update(gen_type_dict.get("type_dict", {}))
-            AdditionalImports.update(gen_type_dict.get("AdditionalImports", {}))
+            AdditionalImports[module] = gen_type_dict.get("AdditionalImports", {})
             ManualFuncs.update(gen_type_dict.get("ManualFuncs", {}))
             func_arg_fix.update(gen_type_dict.get("func_arg_fix", {}))
             enum_fix.update(gen_type_dict.get("enum_fix", {}))
+            const_fix.update(gen_type_dict.get("const_fix", {}))
             namespaces_dict.update(gen_type_dict.get("namespaces_dict", {}))
             module_imports += gen_type_dict.get("module_imports", [])
 
         objc_files_dir = os.path.join(misc_location, 'common')
+        copied_files = []
         if os.path.exists(objc_files_dir):
-            copy_objc_files(objc_files_dir, objc_base_path, module, True)
+            copied_files += copy_objc_files(objc_files_dir, objc_base_path, module, True)
+
         if args.target == 'ios':
             ios_files_dir = os.path.join(misc_location, 'ios')
             if os.path.exists(ios_files_dir):
-                copy_objc_files(ios_files_dir, objc_base_path, module, True)
+                copied_files += copy_objc_files(ios_files_dir, objc_base_path, module, True)
 
         objc_test_files_dir = os.path.join(misc_location, 'test')
         if os.path.exists(objc_test_files_dir):
@@ -1375,8 +1591,12 @@ if __name__ == "__main__":
             if os.path.exists(objc_test_resources_dir):
                 copy_tree(objc_test_resources_dir, os.path.join(objc_test_base_path, 'test', 'resources'))
 
+        manual_classes = filter(lambda x:type_dict.has_key(x),
+                                map(lambda x: x[x.rfind('/')+1:-2],
+                                    filter(lambda x: x.endswith('.h'), copied_files)))
+
         if len(srcfiles) > 0:
-            generator.gen(srcfiles, module, dstdir, objc_base_path, common_headers)
+            generator.gen(srcfiles, module, dstdir, objc_base_path, common_headers, manual_classes)
         else:
             logging.info("No generated code for module: %s", module)
     generator.finalize(objc_base_path)

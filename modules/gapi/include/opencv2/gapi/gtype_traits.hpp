@@ -2,7 +2,7 @@
 // It is subject to the license terms in the LICENSE file found in the top-level directory
 // of this distribution and at http://opencv.org/license.html.
 //
-// Copyright (C) 2018 Intel Corporation
+// Copyright (C) 2018-2020 Intel Corporation
 
 
 #ifndef OPENCV_GAPI_GTYPE_TRAITS_HPP
@@ -15,6 +15,7 @@
 #include <opencv2/gapi/gscalar.hpp>
 #include <opencv2/gapi/garray.hpp>
 #include <opencv2/gapi/gopaque.hpp>
+#include <opencv2/gapi/gframe.hpp>
 #include <opencv2/gapi/streaming/source.hpp>
 #include <opencv2/gapi/gcommon.hpp>
 
@@ -49,31 +50,37 @@ namespace detail
     template<typename T> struct GTypeTraits
     {
         static constexpr const ArgKind kind = ArgKind::OPAQUE_VAL;
+        static constexpr const OpaqueKind op_kind = OpaqueKind::CV_UNKNOWN;
     };
     template<>           struct GTypeTraits<cv::GMat>
     {
         static constexpr const ArgKind kind = ArgKind::GMAT;
         static constexpr const GShape shape = GShape::GMAT;
+        static constexpr const OpaqueKind op_kind = OpaqueKind::CV_UNKNOWN;
     };
     template<>           struct GTypeTraits<cv::GMatP>
     {
         static constexpr const ArgKind kind = ArgKind::GMATP;
         static constexpr const GShape shape = GShape::GMAT;
+        static constexpr const OpaqueKind op_kind = OpaqueKind::CV_UNKNOWN;
     };
     template<>           struct GTypeTraits<cv::GFrame>
     {
         static constexpr const ArgKind kind = ArgKind::GFRAME;
         static constexpr const GShape shape = GShape::GMAT;
+        static constexpr const OpaqueKind op_kind = OpaqueKind::CV_UNKNOWN;
     };
     template<>           struct GTypeTraits<cv::GScalar>
     {
         static constexpr const ArgKind kind = ArgKind::GSCALAR;
         static constexpr const GShape shape = GShape::GSCALAR;
+        static constexpr const OpaqueKind op_kind = OpaqueKind::CV_UNKNOWN;
     };
     template<class T> struct GTypeTraits<cv::GArray<T> >
     {
         static constexpr const ArgKind kind = ArgKind::GARRAY;
         static constexpr const GShape shape = GShape::GARRAY;
+        static constexpr const OpaqueKind op_kind = GOpaqueTraits<T>::kind;
         using host_type  = std::vector<T>;
         using strip_type = cv::detail::VectorRef;
         static cv::detail::GArrayU   wrap_value(const cv::GArray<T>  &t) { return t.strip();}
@@ -84,6 +91,7 @@ namespace detail
     {
         static constexpr const ArgKind kind = ArgKind::GOPAQUE;
         static constexpr const GShape shape = GShape::GOPAQUE;
+        static constexpr const OpaqueKind op_kind = GOpaqueTraits<T>::kind;
         using host_type  = T;
         using strip_type = cv::detail::OpaqueRef;
         static cv::detail::GOpaqueU  wrap_value(const cv::GOpaque<T>  &t) { return t.strip();}

@@ -21,10 +21,24 @@ if(OPENCV_DNN_OPENCL AND HAVE_OPENCL)
   add_definitions(-DCV_OCL4DNN=1)
 endif()
 
-ocv_option(OPENCV_DNN_CUDA "Build with CUDA support" HAVE_CUDA AND HAVE_CUBLAS AND HAVE_CUDNN)
+ocv_option(OPENCV_DNN_CUDA "Build with CUDA support"
+    HAVE_CUDA
+    AND HAVE_CUBLAS
+    AND HAVE_CUDNN
+)
 
-if(OPENCV_DNN_CUDA AND HAVE_CUDA AND HAVE_CUBLAS AND HAVE_CUDNN)
-  add_definitions(-DCV_CUDA4DNN=1)
+if(OPENCV_DNN_CUDA)
+  if(HAVE_CUDA AND HAVE_CUBLAS AND HAVE_CUDNN)
+    add_definitions(-DCV_CUDA4DNN=1)
+  else()
+    if(NOT HAVE_CUDA)
+      message(SEND_ERROR "DNN: CUDA backend requires CUDA Toolkit. Please resolve dependency or disable OPENCV_DNN_CUDA=OFF")
+    elseif(NOT HAVE_CUBLAS)
+      message(SEND_ERROR "DNN: CUDA backend requires cuBLAS. Please resolve dependency or disable OPENCV_DNN_CUDA=OFF")
+    elseif(NOT HAVE_CUDNN)
+      message(SEND_ERROR "DNN: CUDA backend requires cuDNN. Please resolve dependency or disable OPENCV_DNN_CUDA=OFF")
+    endif()
+  endif()
 endif()
 
 ocv_cmake_hook_append(INIT_MODULE_SOURCES_opencv_dnn "${CMAKE_CURRENT_LIST_DIR}/cmake/hooks/INIT_MODULE_SOURCES_opencv_dnn.cmake")
@@ -114,17 +128,10 @@ else()
   set(sources_options ${sources_options} EXCLUDE_CUDA)
 endif()
 
-
 if(HAVE_TENGINE)
 	list(APPEND include_dirs ${TENGINE_INCLUDE_DIRS})
-	if(EXISTS ${TENGINE_LIBRARIES})
-		list(APPEND libs ${TENGINE_LIBRARIES})
-	else()
-		ocv_add_dependencies(opencv_dnn tengine)
-		list(APPEND libs ${TENGINE_LIBRARIES})
-	endif()
+	list(APPEND libs -Wl,--whole-archive ${TENGINE_LIBRARIES} -Wl,--no-whole-archive)
 endif()
-
 
 ocv_module_include_directories(${include_dirs})
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
